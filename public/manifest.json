@@ -1,0 +1,13 @@
+{
+  "name": "Macro Lens",
+  "short_name": "Macro Lens",
+  "description": "Snap a meal to estimate calories and macros, and track a weight loss or gain plan.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#EDF2EE",
+  "theme_color": "#2B684A",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}
