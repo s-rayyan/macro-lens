@@ -21,10 +21,12 @@ const COACH_INSTRUCTIONS = `You are a friendly, practical nutrition coach. Here 
 
 Give exactly 3 short, specific tips for the rest of today and this week, based on the numbers above (for example which macro is short and which foods would close the gap). One sentence each, plain text, each line starting with "• ". No intro or sign-off. Don't give medical advice.`;
 
-// Photo estimates prefer the stronger Flash model; when its small free quota
-// runs out we fall back to Flash-Lite. Coach tips go to Flash-Lite first.
+// Flash-Lite goes first: on the free tier it answers in 1–3 s and allows far
+// more requests per day, while full Flash is often overloaded and allows only
+// ~20 free requests a day. Set GEMINI_MODEL (e.g. "gemini-flash-latest") to
+// prefer a different model for meal estimates.
 const modelsFor = (kind, override) => kind === 'meal'
-  ? [override, 'gemini-flash-latest', 'gemini-flash-lite-latest'].filter(Boolean)
+  ? [override, 'gemini-flash-lite-latest', 'gemini-flash-latest'].filter(Boolean)
   : ['gemini-flash-lite-latest', 'gemini-flash-latest'];
 
 let discovered = null; // cached result of listing models, used if the aliases above ever go away
@@ -44,16 +46,61 @@ async function discoverModels(key) {
   return discovered;
 }
 
-async function generate(model, parts, key, json) {
-  const r = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: json ? { responseMimeType: 'application/json', temperature: 0.2 } : { temperature: 0.6 },
-    }),
+// When Google's servers are busy a request can hang for 60–90 s before failing
+// with 503. So: if the preferred model hasn't answered after HEDGE_MS, also ask
+// the next one and use whichever answers first; move on at once when a model
+// fails; and put a model that was busy or out of quota at the back of the line
+// for a few minutes.
+const HEDGE_MS = 6000, MAX_MS = 50000, SLOW_COOLDOWN_MS = 2 * 60e3;
+const FALLBACK = new Set([404, 429, 500, 503, 504]); // unknown model, quota, overloaded, timed out
+const COOLDOWN_MS = { 429: 10 * 60e3, 503: 5 * 60e3, 504: 5 * 60e3, 500: 2 * 60e3 };
+const coolUntil = new Map(); // model -> timestamp; lives as long as the server instance does
+const isCool = m => (coolUntil.get(m) || 0) > Date.now();
+
+// Start list[0]; start the next model when the current one fails with a
+// fallback error or HEDGE_MS passes (calling onSlow for the slow one);
+// resolve with the first success.
+function hedge(list, call, onSlow) {
+  return new Promise((resolve, reject) => {
+    let next = 0, live = 0, settled = false, last, timer;
+    const finish = (fn, v) => { if (!settled) { settled = true; clearTimeout(timer); fn(v); } };
+    const launch = () => {
+      clearTimeout(timer);
+      if (settled) return;
+      if (next >= list.length) { if (!live) finish(reject, last || new Error('no model available')); return; }
+      live++;
+      call(list[next++]).then(v => finish(resolve, v), e => {
+        live--; last = e;
+        if (!FALLBACK.has(e.status)) finish(reject, e); else launch();
+      });
+      if (next < list.length) {
+        const slow = list[next - 1];
+        timer = setTimeout(() => { onSlow?.(slow); launch(); }, HEDGE_MS);
+      }
+    };
+    launch();
   });
+}
+
+async function generate(model, parts, key, json, timeoutMs) {
+  const t0 = Date.now();
+  let r;
+  try {
+    r = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts }],
+        generationConfig: json ? { responseMimeType: 'application/json', temperature: 0.2 } : { temperature: 0.6 },
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    console.log(JSON.stringify({ model, status: 'timeout', ms: Date.now() - t0 }));
+    const e = new Error(`timed out after ${timeoutMs} ms`); e.status = 504; throw e;
+  }
   const j = await r.json().catch(() => ({}));
+  console.log(JSON.stringify({ model, version: j.modelVersion, status: r.status, ms: Date.now() - t0, err: j?.error?.message?.slice(0, 120) }));
   if (!r.ok) {
     const e = new Error(j?.error?.message || `Gemini returned ${r.status}`);
     e.status = r.status;
@@ -68,18 +115,19 @@ async function generate(model, parts, key, json) {
 async function run(kind, parts, key, json, override) {
   const tried = new Set();
   let last;
+  const call = m => generate(m, parts, key, json, MAX_MS).catch(e => {
+    if (COOLDOWN_MS[e.status]) coolUntil.set(m, Date.now() + COOLDOWN_MS[e.status]);
+    throw e;
+  });
   const attempt = async list => {
-    for (const m of list) {
-      if (tried.has(m)) continue;
-      tried.add(m);
-      try { return await generate(m, parts, key, json); }
-      catch (e) {
-        last = e;
-        // try the next model on: unknown model, quota exhausted, overloaded
-        if (![404, 429, 500, 503].includes(e.status)) throw e;
-      }
-    }
-    return null;
+    list = list.filter(m => !tried.has(m));
+    list.forEach(m => tried.add(m));
+    // models that were busy recently go to the back of the line
+    list = [...list.filter(m => !isCool(m)), ...list.filter(isCool)];
+    if (!list.length) return null;
+    const onSlow = m => { if (!isCool(m)) coolUntil.set(m, Date.now() + SLOW_COOLDOWN_MS); };
+    try { return await hedge(list, call, onSlow); }
+    catch (e) { last = e; if (!FALLBACK.has(e.status)) throw e; return null; }
   };
   const out = (await attempt(modelsFor(kind, override))) ??(await attempt(await discoverModels(key)));
   if (out != null) return out;
