@@ -1,8 +1,8 @@
-// Vercel serverless function: sends meal photos/descriptions to Google Gemini
+// Sends meal photos/descriptions to Google Gemini
 // and returns a nutrition estimate. The prompts live here (not in the page) so
 // this endpoint can't be used as a general-purpose proxy for your API key.
 //
-// Env vars (Vercel → Project → Settings → Environment Variables):
+// Env vars / secrets (Cloudflare → Workers → macro-lens → Settings → Variables):
 //   GEMINI_API_KEY  required — free key from https://aistudio.google.com/apikey
 //   GEMINI_MODEL    optional — override the model used for meal photos
 
@@ -23,10 +23,9 @@ Give exactly 3 short, specific tips for the rest of today and this week, based o
 
 // Photo estimates prefer the stronger Flash model; when its small free quota
 // runs out we fall back to Flash-Lite. Coach tips go to Flash-Lite first.
-const MODELS = {
-  meal: [process.env.GEMINI_MODEL, 'gemini-flash-latest', 'gemini-flash-lite-latest'].filter(Boolean),
-  coach: ['gemini-flash-lite-latest', 'gemini-flash-latest'],
-};
+const modelsFor = (kind, override) => kind === 'meal'
+  ? [override, 'gemini-flash-latest', 'gemini-flash-lite-latest'].filter(Boolean)
+  : ['gemini-flash-lite-latest', 'gemini-flash-latest'];
 
 let discovered = null; // cached result of listing models, used if the aliases above ever go away
 async function discoverModels(key) {
@@ -66,7 +65,7 @@ async function generate(model, parts, key, json) {
   return text;
 }
 
-async function run(kind, parts, key, json) {
+async function run(kind, parts, key, json, override) {
   const tried = new Set();
   let last;
   const attempt = async list => {
@@ -82,7 +81,7 @@ async function run(kind, parts, key, json) {
     }
     return null;
   };
-  const out = (await attempt(MODELS[kind])) ?? (await attempt(await discoverModels(key)));
+  const out = (await attempt(modelsFor(kind, override))) ??(await attempt(await discoverModels(key)));
   if (out != null) return out;
   throw last || new Error('no model available');
 }
@@ -94,12 +93,12 @@ function parseJson(text) {
   return null;
 }
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') { res.setHeader('allow', 'POST'); return res.status(405).json({ error: 'method_not_allowed' }); }
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) return res.status(503).json({ error: 'not_configured' });
-
-  const body = typeof req.body === 'string' ? (() => { try { return JSON.parse(req.body); } catch { return {}; } })() : (req.body || {});
+// Platform-neutral core: takes the parsed request body and an env object
+// ({GEMINI_API_KEY, GEMINI_MODEL}) and returns {status, data}.
+export async function estimate(body, env = {}) {
+  const key = env.GEMINI_API_KEY;
+  if (!key) return { status: 503, data: { error: 'not_configured' } };
+  body = body && typeof body === 'object' ? body : {};
   try {
     if (body.kind === 'meal') {
       const note = String(body.note || '').slice(0, 800);
@@ -107,27 +106,27 @@ export default async function handler(req, res) {
       if (body.source === 'photo') {
         const mime = String(body.mime || 'image/jpeg').toLowerCase();
         const data = String(body.image || '');
-        if (!MIME.has(mime) || !data) return res.status(400).json({ error: 'image_rejected' });
-        if (data.length > 4.4e6) return res.status(413).json({ error: 'too_large' });
+        if (!MIME.has(mime) || !data) return { status: 400, data: { error: 'image_rejected' } };
+        if (data.length > 4.4e6) return { status: 413, data: { error: 'too_large' } };
         parts.push({ inline_data: { mime_type: mime, data } });
         parts.push({ text: `${MEAL_INSTRUCTIONS}\n\nThe attached photo shows food or drink someone is about to eat.${note ? ` They add: "${note}". Trust their note over the photo where they disagree.` : ''}` });
       } else {
-        if (!note.trim()) return res.status(400).json({ error: 'no_food' });
+        if (!note.trim()) return { status: 400, data: { error: 'no_food' } };
         parts.push({ text: `${MEAL_INSTRUCTIONS}\n\nSomeone describes what they ate: "${note}".` });
       }
-      const text = await run('meal', parts, key, true);
+      const text = await run('meal', parts, key, true, env.GEMINI_MODEL);
       const r = parseJson(text);
-      if (!r) return res.status(502).json({ error: 'invalid_json' });
-      if (r.error || !Array.isArray(r.items) || !r.items.length) return res.status(422).json({ error: 'no_food' });
-      return res.status(200).json(r);
+      if (!r) return { status: 502, data: { error: 'invalid_json' } };
+      if (r.error || !Array.isArray(r.items) || !r.items.length) return { status: 422, data: { error: 'no_food' } };
+      return { status: 200, data: r };
     }
     if (body.kind === 'coach') {
       const summary = String(body.summary || '').slice(0, 4000);
-      if (!summary.trim()) return res.status(400).json({ error: 'bad_request' });
+      if (!summary.trim()) return { status: 400, data: { error: 'bad_request' } };
       const text = await run('coach', [{ text: COACH_INSTRUCTIONS.replace('{SUMMARY}', summary) }], key, false);
-      return res.status(200).json({ text });
+      return { status: 200, data: { text } };
     }
-    return res.status(400).json({ error: 'bad_request' });
+    return { status: 400, data: { error: 'bad_request' } };
   } catch (e) {
     console.error('estimate failed:', e.status, e.message);
     const code = e.status === 429 ? 'rate_limited'
@@ -135,6 +134,14 @@ export default async function handler(req, res) {
       : e.status === 400 && /image|mime|inline/i.test(e.message) ? 'image_rejected'
       : (e.status === 400 || e.status === 403) && /api key|API_KEY|permission/i.test(e.message) ? 'not_configured'
       : 'upstream_error';
-    return res.status(e.status === 429 ? 429 : 502).json({ error: code });
+    return { status: e.status === 429 ? 429 : 502, data: { error: code } };
   }
+}
+
+// Node-style handler (used by server.js for local runs).
+export default async function handler(req, res) {
+  if (req.method !== 'POST') { res.setHeader('allow', 'POST'); return res.status(405).json({ error: 'method_not_allowed' }); }
+  const body = typeof req.body === 'string' ? (() => { try { return JSON.parse(req.body); } catch { return {}; } })() : req.body;
+  const { status, data } = await estimate(body, process.env);
+  return res.status(status).json(data);
 }
