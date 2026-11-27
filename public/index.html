@@ -21,6 +21,7 @@
 /* Layout: one-column phone app, max 560px, bottom tab bar with a raised camera button; meal results render as a nutrition-label card.
    Theme "Farmers Market": cream paper, tomato accent, herb-green progress, food-coded macros (beet / wheat / avocado). */
 :root{
+  --star:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2.5l2.9 6.1 6.6.8-4.9 4.6 1.3 6.6L12 17.3l-5.9 3.3 1.3-6.6-4.9-4.6 6.6-.8z'/%3E%3C/svg%3E");
   --bg:#F5EEDF; --surface:#FFFBF3; --surface-2:#EFE5D2; --ink:#2B2019; --muted:#7A6A58; --line:#E3D6BF;
   --accent:#D2462A; --accent-ink:#FFFFFF; --accent-soft:#FADFD4; --accent-deep:#A93219;
   --ring:#4E7D33; --protein:#A8386A; --carbs:#C7870A; --fat:#6A8A1F; --warn:#B3261E; --good:#3F7A3A;
@@ -136,6 +137,24 @@ button{cursor:pointer}
 .meal .kc b{font-family:var(--f-display);font-size:1.1rem}
 .meal .kc small{display:block;font-size:.72rem;color:var(--muted)}
 .pcf{display:flex;gap:8px;font-size:.74rem;font-variant-numeric:tabular-nums}
+.meal .tip{grid-column:2/-1;font-size:.78rem;color:var(--muted);margin-top:-4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.meal .nm{display:flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:0}
+.meal .nm .name{max-width:100%}
+/* star ratings */
+.stars{display:inline-flex;gap:1px;flex:none;vertical-align:middle;--sz:13px}
+.stars i{width:var(--sz);height:var(--sz);background:var(--line);-webkit-mask:var(--star) center/contain no-repeat;mask:var(--star) center/contain no-repeat}
+.stars i.on{background:var(--carbs)}
+.stars i.half{background:linear-gradient(90deg,var(--carbs) 50%,var(--line) 50%)}
+.stars.lg{--sz:22px;gap:2px}
+.rate{display:flex;gap:14px;align-items:flex-start}
+.rate .score{font-family:var(--f-display);font-size:1.9rem;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.rate .score small{font-size:.9rem;color:var(--muted);font-weight:600}
+.rate .why{font-size:.9rem;margin:4px 0 0}
+.rate .verdict{font-weight:700;font-size:.85rem;margin-left:6px;vertical-align:middle}
+.dayrates{display:flex;flex-direction:column;margin-top:12px;border-top:1px solid var(--line)}
+.dayrates button{display:flex;align-items:center;gap:10px;background:none;border:0;border-bottom:1px solid var(--line);padding:10px 0;color:inherit;font:inherit;text-align:left;width:100%;cursor:pointer}
+.dayrates .d{width:104px;flex:none;font-weight:600}
+.dayrates .v{margin-left:auto;font-size:.8rem;color:var(--muted)}
 .linkbtn{background:none;border:0;padding:4px 0;color:var(--muted);font-size:.78rem;text-decoration:underline;text-underline-offset:2px}
 .confirm{display:flex;gap:8px;justify-content:flex-end;grid-column:1/-1}
 .empty{text-align:center;padding:18px 8px;color:var(--muted);display:flex;flex-direction:column;gap:6px;align-items:center}
@@ -475,7 +494,67 @@ function defaultType() {
   return h < 10.5 ? 'breakfast' : h < 15 ? 'lunch' : h < 17 ? 'snack' : h < 21.5 ? 'dinner' : 'snack';
 }
 
+/* ---------- ratings ---------- */
+const clamp01 = v => Math.max(0, Math.min(1, v));
+// Meals estimated by Gemini carry its rating and advice. Meals typed in by hand
+// (or saved before ratings existed) get a quick score from their numbers.
+function quickMeal(m) {
+  const kcal = +m.kcal || 0;
+  if (!kcal) return null;
+  const t = targets(), prot = (+m.p || 0) * 4 / kcal, fat = (+m.f || 0) * 9 / kcal, size = kcal / (t.kcal / 3);
+  let s = 0.4 + clamp01((prot - 0.1) / 0.2) * 0.5;
+  if (size > 1.3) s -= Math.min(0.35, (size - 1.3) * 0.4);
+  if (fat > 0.45) s -= 0.1;
+  const advice = prot < 0.15 ? 'Light on protein. Add eggs, chicken, fish, tofu or Greek yogurt to make it more filling.'
+    : size > 1.3 ? `A big share of your day (${r0(kcal / t.kcal * 100)}%). A smaller portion or extra vegetables would help.`
+    : fat > 0.45 ? 'Quite high in fat. Go lighter on oil, butter, cheese or dressing.'
+    : 'Good protein for the calories. Add vegetables if there were none.';
+  return {stars: Math.max(1, Math.min(5, Math.round(s * 5))), advice, ai: false};
+}
+const mealScore = m => m.rating ? {stars: m.rating, advice: m.advice || '', ai: true} : quickMeal(m);
+const verdict = n => n >= 4.5 ? 'Excellent' : n >= 3.5 ? 'Great' : n >= 2.5 ? 'Okay' : n >= 1.5 ? 'Needs work' : 'Rough';
+
+function dayRating(k) {
+  const ms = dayMeals(k);
+  if (!ms.length) return null;
+  const t = targets(), s = sumMeals(ms);
+  const live = k === todayKey() && new Date().getHours() < 21; // the day isn't over yet
+  const ratio = s.kcal / t.kcal;
+  const [lo, hi] = t.dir < 0 ? [0.9, 1.03] : t.dir > 0 ? [0.97, 1.1] : [0.93, 1.07];
+  const kcalS = ratio > hi ? clamp01(1 - (ratio - hi) / 0.3) : live || ratio >= lo ? 1 : clamp01(1 - (lo - ratio) / 0.4);
+  const pace = live ? Math.max(0.25, Math.min(1, ratio)) : 1; // so far today, protein should keep pace with calories
+  const protS = clamp01(s.p / t.protein / pace / 0.9);
+  const fatS = clamp01(1 - Math.max(0, s.f / t.fat / pace - 1.25) / 0.5);
+  const sc = ms.map(mealScore).filter(Boolean);
+  const qual = sc.length ? (sc.reduce((a, x) => a + x.stars, 0) / sc.length - 1) / 4 : 0.6;
+  const score = 0.4 * kcalS + 0.3 * protS + 0.1 * fatS + 0.2 * qual;
+  const stars = Math.max(1, Math.round(score * 10) / 2);
+  const left = r0(t.kcal - s.kcal), pLeft = Math.max(0, r0(t.protein - s.p));
+  let tip;
+  if (ratio > hi) tip = `${r0(s.kcal - t.kcal).toLocaleString()} kcal over target. ${live ? 'Keep the rest of today light: vegetables, lean protein and zero-calorie drinks.' : 'Tomorrow, build your biggest meal around lean protein and vegetables.'}`;
+  else if (protS < 0.8) tip = live ? `Protein is falling behind, with ${pLeft} g to go. Greek yogurt, eggs, chicken, tofu or a shake would close the gap.` : `Protein came in ${pLeft} g short. Put a protein source in every meal tomorrow.`;
+  else if (!live && ratio < lo) tip = t.dir < 0 && ratio < 0.75 ? `Only ${r0(ratio * 100)}% of your calories. Eating this little is hard to keep up and can cost muscle, so aim closer to ${t.kcal.toLocaleString()} kcal.` : `${left.toLocaleString()} kcal under target. ${t.dir > 0 ? 'To gain, add a snack such as nuts, a smoothie or toast with peanut butter.' : 'Fine now and then. Check that no snacks went unlogged.'}`;
+  else if (qual < 0.5) tip = 'The numbers are on track but the meals scored low. Swap one processed item for whole foods or vegetables.';
+  else if (fatS < 0.8) tip = 'Fat ran high. Go lighter on oil, butter, cheese or dressing.';
+  else tip = live ? `On track. ${left.toLocaleString()} kcal${pLeft ? ` and ${pLeft} g protein` : ''} left for today.` : 'Great day: on target, with plenty of protein.';
+  return {stars, tip, live};
+}
+
 /* ---------- rendering helpers ---------- */
+function stars(n, cls = '') {
+  let h = `<span class="stars ${cls}" role="img" aria-label="${n} out of 5 stars">`;
+  for (let i = 1; i <= 5; i++) h += `<i class="${n >= i ? 'on' : n >= i - 0.5 ? 'half' : ''}"></i>`;
+  return h + '</span>';
+}
+function rateBlock(eyebrow, n, text) {
+  return `<section class="card"><div class="eyebrow">${eyebrow}</div>
+    <div class="rate"><div class="score">${n}<small>/5</small></div>
+    <div class="grow"><div>${stars(n, 'lg')}<span class="verdict">${verdict(n)}</span></div>${text ? `<p class="why">${esc(text)}</p>` : ''}</div></div></section>`;
+}
+function dayCard(k) {
+  const r = dayRating(k);
+  return r ? rateBlock(r.live ? 'Your day so far' : 'Day rating', r.stars, r.tip) : '';
+}
 function ring(eaten, target) {
   const r = 54, c = 2 * Math.PI * r, pct = Math.min(1, eaten / target), over = eaten > target;
   return `<svg viewBox="0 0 132 132" class="ring" aria-hidden="true"><circle cx="66" cy="66" r="${r}" class="ring-track"/>${pct > 0 ? `<circle cx="66" cy="66" r="${r}" class="ring-fill ${over ? 'over' : ''}" stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${(c * (1 - pct)).toFixed(1)}" transform="rotate(-90 66 66)"/>` : ''}</svg>`;
@@ -509,6 +588,7 @@ function vToday() {
       <div class="macros">${macroBar('Protein', 'p', tot.p, t.protein)}${macroBar('Carbs', 'c', tot.c, t.carbs)}${macroBar('Fat', 'f', tot.f, t.fat)}</div>
       <div class="kcal-line"><span class="num">Eaten ${r0(tot.kcal).toLocaleString()} kcal</span><span class="num">Target ${t.kcal.toLocaleString()} kcal${t.isDefault ? ' (default)' : ''}</span></div>
     </div></section>`;
+  h += dayCard(S.date);
   h += `<div class="adds">
     <button class="btn primary" data-act="tab" data-v="log">${ICON.cam}Snap a meal</button>
     <button class="btn" data-act="describe">${ICON.pen}Describe</button>
@@ -524,12 +604,14 @@ function vToday() {
       h += `<div class="group"><h3><span>${TYPE_L[ty]}</span><span class="num">${r0(gt.kcal)} kcal</span></h3>`;
       for (const m of g) {
         const sub = (m.items || []).map(i => i.name).filter(Boolean).slice(0, 4).join(', ');
+        const sc = mealScore(m);
         h += `<div class="meal">
           ${m.thumb ? `<img class="thumb" src="${esc(m.thumb)}" alt="">` : `<div class="thumb">${ICON.plate}</div>`}
-          <div style="min-width:0"><div class="name">${esc(m.name || 'Meal')}</div>
+          <div style="min-width:0"><div class="nm"><div class="name">${esc(m.name || 'Meal')}</div>${sc ? stars(sc.stars) : ''}</div>
             <div class="sub">${esc(sub)}</div>
             <div class="pcf"><span class="p-c">P ${r0(m.p)}g</span><span class="c-c">C ${r0(m.c)}g</span><span class="f-c">F ${r0(m.f)}g</span></div></div>
           <div class="kc"><b>${r0(m.kcal)}</b><small>kcal</small>${S.confirmDel === m.id ? '' : `<button class="linkbtn" data-act="delMeal" data-id="${esc(m.id)}">Remove</button>`}</div>
+          ${sc?.advice ? `<div class="tip">${esc(sc.advice)}</div>` : ''}
           ${S.confirmDel === m.id ? `<div class="confirm"><span class="small muted grow">Remove this meal?</span><button class="btn small ghost" data-act="cancelDel">Keep</button><button class="btn small danger" data-act="confirmDel" data-id="${esc(m.id)}">Remove</button></div>` : ''}
         </div>`;
       }
@@ -601,6 +683,7 @@ function resultView(d) {
   const pct = (v, T) => T ? `${r0(v / T * 100)}%` : '';
   let h = '';
   if (d.url) h += `<img class="preview" src="${esc(d.url)}" alt="Your meal photo" style="aspect-ratio:16/9">`;
+  if (d.result.rating) h += rateBlock('Meal rating', d.result.rating, d.result.advice);
   h += `<div class="label">
     <div class="lh">Nutrition Estimate</div>
     <input class="lname" id="mealName" data-f="name" value="${esc(d.result.name)}" placeholder="Name this meal" aria-label="Meal name">
@@ -654,7 +737,7 @@ function vProgress() {
     <div class="row"><div class="unit grow"><input class="in" id="wIn" data-f="wIn" inputmode="decimal" placeholder="${todayEntry ? wDisp(todayEntry.kg).toFixed(1) : wDisp(cur).toFixed(1)}" value="${esc(S.wIn)}" aria-label="Today's weight"><span>${wUnit()}</span></div>
     <button class="btn primary" data-act="logWeight">${todayEntry ? 'Update today' : 'Log today'}</button></div>
     <div class="wlist">${S.weights.slice(-6).reverse().map(w => `<div class="row between"><span>${esc(fmtLong(w.d))}</span><span class="row"><b>${fmtW(w.kg)}</b>${S.weights.length > 1 ? `<button class="linkbtn" data-act="delWeight" data-d="${esc(w.d)}" aria-label="Delete weigh-in on ${esc(fmtLong(w.d))}">Delete</button>` : ''}</span></div>`).join('')}</div></section>`;
-  h += `<section class="card"><div class="row between"><h2>Last 7 days</h2><span class="small muted">kcal per day</span></div>${kcalChart()}${weekStats()}</section>`;
+  h += `<section class="card"><div class="row between"><h2>Last 7 days</h2><span class="small muted">kcal per day</span></div>${kcalChart()}${weekStats()}${dayRates()}</section>`;
   return h;
 }
 
@@ -718,6 +801,12 @@ function kcalChart() {
   return s + `</svg>`;
 }
 
+function dayRates() {
+  const tk = todayKey();
+  const rows = Array.from({length: 7}, (_, i) => addDays(tk, -i)).map(k => ({k, r: dayRating(k)})).filter(x => x.r);
+  if (!rows.length) return '';
+  return `<div class="dayrates">${rows.map(({k, r}) => `<button data-act="openDay" data-d="${esc(k)}" aria-label="Open ${esc(fmtLong(k))}"><span class="d">${esc(k === tk ? 'Today' : parseKey(k).toLocaleDateString(undefined, {weekday: 'short', day: 'numeric', month: 'short'}))}</span>${stars(r.stars)}<span class="v">${verdict(r.stars)}${r.live ? ' so far' : ''}</span></button>`).join('')}</div>`;
+}
 function weekStats() {
   const t = targets(), tk = todayKey();
   const ks = Array.from({length: 7}, (_, i) => addDays(tk, i - 6)).filter(k => dayMeals(k).length);
@@ -982,6 +1071,8 @@ function normalize(r) {
     items: r.items.slice(0, 20).map(i => ({name: String(i.name || '').slice(0, 80), portion: String(i.portion || '').slice(0, 80), kcal: n(i.kcal), p: n(i.protein_g ?? i.protein), c: n(i.carbs_g ?? i.carbs), f: n(i.fat_g ?? i.fat)})),
     confidence: ['low', 'medium', 'high'].includes(r.confidence) ? r.confidence : '',
     notes: String(r.notes || '').slice(0, 240),
+    rating: Math.max(0, Math.min(5, Math.round(Number(r.rating) || 0))) || null,
+    advice: String(r.advice || '').slice(0, 240),
   };
 }
 async function analyze() {
@@ -990,7 +1081,9 @@ async function analyze() {
   d.status = 'analyzing'; d.error = ''; render();
   const ctl = new AbortController(); d.ctl = ctl;
   try {
-    const body = {kind: 'meal', source: d.source, note: d.note.trim().slice(0, 800)};
+    const t = targets();
+    const goal = `${t.isDefault ? 'no plan set yet' : t.dir < 0 ? 'losing weight' : t.dir > 0 ? 'gaining weight' : 'maintaining weight'}, ${t.kcal} kcal, ${t.protein} g protein, ${t.carbs} g carbs, ${t.fat} g fat a day; this is their ${d.type}`;
+    const body = {kind: 'meal', source: d.source, note: d.note.trim().slice(0, 800), goal};
     if (d.source === 'photo') {
       if (d.blob.size > 3.2e6) throw {code: 'too_large'};
       body.image = await blobToBase64(d.blob);
@@ -1019,6 +1112,7 @@ function saveMeal() {
   const meal = {id: 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), at: Date.now(), type: d.type, name: d.result.name.trim() || items[0].name, items, kcal: r0(t.kcal), p: r1(t.p), c: r1(t.c), f: r1(t.f), source: d.source};
   if (d.thumb) meal.thumb = d.thumb;
   if (d.result.confidence) meal.confidence = d.result.confidence;
+  if (d.result.rating) { meal.rating = d.result.rating; meal.advice = d.result.advice; }
   const k = S.date;
   S.days[k] = {meals: [...dayMeals(k), meal]};
   saveDay(k);
@@ -1069,6 +1163,7 @@ document.addEventListener('click', e => {
     case 'prevDay': S.date = addDays(S.date, -1); S.confirmDel = null; render(); break;
     case 'nextDay': if (S.date < todayKey()) { S.date = addDays(S.date, 1); S.confirmDel = null; render(); } break;
     case 'goToday': S.date = todayKey(); render(); break;
+    case 'openDay': S.date = b.dataset.d; go('today'); break;
     case 'delMeal': S.confirmDel = b.dataset.id; render(); break;
     case 'cancelDel': S.confirmDel = null; render(); break;
     case 'confirmDel': { const k = S.date; S.days[k] = {meals: dayMeals(k).filter(m => m.id !== b.dataset.id)}; saveDay(k); S.confirmDel = null; render(); toast('Meal removed'); break; }

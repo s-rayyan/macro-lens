@@ -12,7 +12,8 @@ const MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'im
 const MEAL_INSTRUCTIONS = `You estimate nutrition for a food-tracking app.
 Identify each distinct food or drink and estimate its portion, then estimate calories and macronutrients for that portion. Judge size from cues such as plate size (a dinner plate is about 27 cm across), bowls, cutlery, hands and packaging. Include likely hidden calories: cooking oil, butter, dressing, sauces, sugar in drinks. Use typical values from standard nutrition databases. Round kcal to the nearest 5 and grams to whole numbers.
 Reply with only JSON in this shape:
-{"meal_name":"short name, 2-5 words","items":[{"name":"grilled chicken breast","portion":"1 fillet (150 g)","kcal":250,"protein_g":46,"carbs_g":0,"fat_g":6}],"confidence":"low|medium|high","notes":"one short sentence on the biggest assumption you made"}
+{"meal_name":"short name, 2-5 words","items":[{"name":"grilled chicken breast","portion":"1 fillet (150 g)","kcal":250,"protein_g":46,"carbs_g":0,"fat_g":6}],"confidence":"low|medium|high","notes":"one short sentence on the biggest assumption you made","rating":4,"advice":"one short, friendly, specific sentence on how to make this meal better for their goal, or what to pair it with"}
+"rating" is a whole number from 1 to 5 for how good this meal is for this person: 5 = balanced whole foods with plenty of protein and vegetables at a sensible portion for their goal; 3 = fine but missing something (protein, vegetables or fiber) or a bit large; 1 = mostly fried, sugary or ultra-processed food, or a portion far too big for their goal. Be honest, not harsh: an ordinary home-cooked meal is usually a 3 or 4.
 If there is no food or drink, reply {"error":"no food found"}.`;
 
 const COACH_INSTRUCTIONS = `You are a friendly, practical nutrition coach. Here is a person's goal, daily targets and the last 7 days of food they logged:
@@ -162,6 +163,8 @@ export async function estimate(body, env = {}) {
         if (!note.trim()) return { status: 400, data: { error: 'no_food' } };
         parts.push({ text: `${MEAL_INSTRUCTIONS}\n\nSomeone describes what they ate: "${note}".` });
       }
+      const goal = String(body.goal || '').replace(/["\n\r]/g, ' ').slice(0, 300).trim();
+      if (goal) parts[parts.length - 1].text += `\n\nTheir goal and daily targets, to judge the rating and advice against: ${goal}.`;
       const text = await run('meal', parts, key, true, env.GEMINI_MODEL);
       const r = parseJson(text);
       if (!r) return { status: 502, data: { error: 'invalid_json' } };
